@@ -2,12 +2,17 @@
 import streamlit as st
 import joblib
 import pandas as pd
-from datetime import datetime
+import csv
+import io
+import re
+import math
+
+from datetime import datetime, timezone
 from pathlib import Path
 
-# ---------------------------------
-# PAGE CONFIGURATION
-# ---------------------------------
+# ==========================================
+# 1. PAGE CONFIGURATION
+# ==========================================
 
 st.set_page_config(
     page_title="SpamGuard AI",
@@ -18,38 +23,44 @@ st.set_page_config(
 BASE_DIR = Path(__file__).parent
 MODEL_PATH = BASE_DIR / "spam_detector_improved.pkl"
 
-# ---------------------------------
-# LOAD IMPROVED MODEL
-# ---------------------------------
+MAX_MESSAGE_LENGTH = 2000
+MAX_HISTORY = 100
+
+# ==========================================
+# 2. MODEL LOADING AND VALIDATION
+# ==========================================
 
 @st.cache_resource
 def load_model():
-    if not MODEL_PATH.exists():
+
+    if not MODEL_PATH.is_file():
         raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH.name}. "
-            "Upload spam_detector_improved.pkl to GitHub."
+            "Improved model file is missing."
         )
 
+    # Only load a trusted model file created by us.
     artifact = joblib.load(MODEL_PATH)
 
     if not isinstance(artifact, dict):
-        raise ValueError(
-            "Invalid model format. Expected a dictionary."
-        )
+        raise ValueError("Invalid model artifact.")
 
     if "model" not in artifact or "threshold" not in artifact:
-        raise ValueError(
-            "Model file must contain 'model' and 'threshold' keys. "
-            "Upload the correct improved model."
-        )
+        raise ValueError("Required model information is missing.")
 
     model = artifact["model"]
     threshold = float(artifact["threshold"])
 
     if not hasattr(model, "predict_proba"):
-        raise ValueError(
-            "Loaded model does not support probability predictions."
-        )
+        raise ValueError("Model does not support probability predictions.")
+
+    if not hasattr(model, "classes_"):
+        raise ValueError("Model classes are missing.")
+
+    if "spam" not in list(model.classes_):
+        raise ValueError("Spam class is missing from the model.")
+
+    if not math.isfinite(threshold) or not 0 < threshold < 1:
+        raise ValueError("Invalid spam detection threshold.")
 
     return model, threshold
 
@@ -57,28 +68,72 @@ def load_model():
 try:
     model, SPAM_THRESHOLD = load_model()
 
-except Exception as e:
-    st.error("⚠️ Model Loading Error")
-    st.code(str(e))
+except Exception:
+    st.error("⚠️ Unable to load SpamGuard AI model.")
     st.info(
-        "Check that spam_detector_improved.pkl is uploaded "
-        "in the same GitHub folder as app.py."
+        "Please check that spam_detector_improved.pkl "
+        "is uploaded correctly beside app.py."
     )
     st.stop()
 
-# ---------------------------------
-# SESSION STATE
-# ---------------------------------
+
+# ==========================================
+# 3. SESSION STATE
+# ==========================================
 
 if "history" not in st.session_state:
     st.session_state.history = []
 
-# ---------------------------------
-# CUSTOM DESIGN
-# ---------------------------------
+if "last_analysis" not in st.session_state:
+    st.session_state.last_analysis = None
+
+
+# ==========================================
+# 4. SECURITY HELPERS
+# ==========================================
+
+def sanitize_csv_value(value):
+    """
+    Prevent spreadsheet formula injection
+    when users open exported CSV files.
+    """
+
+    value = str(value)
+
+    if value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+        return "'" + value
+
+    return value
+
+
+def analyze_message(message):
+
+    probabilities = model.predict_proba([message])[0]
+
+    spam_index = list(model.classes_).index("spam")
+
+    spam_probability = float(probabilities[spam_index])
+
+    is_spam = spam_probability >= SPAM_THRESHOLD
+
+    prediction = "SPAM" if is_spam else "NOT SPAM"
+
+    confidence = (
+        spam_probability
+        if is_spam
+        else 1 - spam_probability
+    )
+
+    return prediction, spam_probability, confidence
+
+
+# ==========================================
+# 5. CUSTOM DESIGN
+# ==========================================
 
 st.markdown("""
 <style>
+
 .stApp {
     background: #0b1120;
     color: #f8fafc;
@@ -130,12 +185,14 @@ div[data-testid="stMetric"] {
     border: 1px solid #22c55e;
     color: #bbf7d0;
 }
+
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------
-# HEADER
-# ---------------------------------
+
+# ==========================================
+# 6. HEADER
+# ==========================================
 
 st.markdown(
     '<div class="main-title">🛡️ SpamGuard AI</div>',
@@ -151,9 +208,10 @@ st.markdown(
 
 st.divider()
 
-# ---------------------------------
-# DASHBOARD METRICS
-# ---------------------------------
+
+# ==========================================
+# 7. DASHBOARD METRICS
+# ==========================================
 
 total = len(st.session_state.history)
 
@@ -172,9 +230,10 @@ c3.metric("Safe Messages", safe_count)
 
 st.divider()
 
-# ---------------------------------
-# MESSAGE DETECTOR
-# ---------------------------------
+
+# ==========================================
+# 8. MESSAGE DETECTOR
+# ==========================================
 
 left, right = st.columns([1.5, 1])
 
@@ -185,40 +244,45 @@ with left:
     message = st.text_area(
         "Enter your SMS message",
         placeholder="Paste a suspicious message here...",
-        height=170
+        height=170,
+        max_chars=MAX_MESSAGE_LENGTH
     )
 
-    if st.button("🚀 Detect Spam", use_container_width=True):
+    st.caption(
+        f"Maximum message length: {MAX_MESSAGE_LENGTH} characters."
+    )
 
-        if not message.strip():
+    detect_clicked = st.button(
+        "🚀 Detect Spam",
+        use_container_width=True
+    )
+
+    if detect_clicked:
+
+        if not message or not message.strip():
+
             st.warning("Please enter a message.")
 
+        elif len(message) > MAX_MESSAGE_LENGTH:
+
+            st.error("Message is too long.")
+
         else:
+
             try:
-                probabilities = model.predict_proba([message])[0]
 
-                spam_index = list(model.classes_).index("spam")
-
-                spam_probability = float(
-                    probabilities[spam_index]
+                prediction, spam_probability, confidence = (
+                    analyze_message(message.strip())
                 )
 
-                is_spam = spam_probability >= SPAM_THRESHOLD
-
-                result = "SPAM" if is_spam else "NOT SPAM"
-
-                confidence = (
-                    spam_probability
-                    if is_spam
-                    else 1 - spam_probability
-                )
+                timestamp = datetime.now(
+                    timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
                 st.session_state.history.insert(0, {
-                    "Time": datetime.now().strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    "Message": message,
-                    "Prediction": result,
+                    "Time": timestamp,
+                    "Message": message.strip(),
+                    "Prediction": prediction,
                     "Spam Probability": round(
                         spam_probability * 100, 2
                     ),
@@ -227,7 +291,12 @@ with left:
                     )
                 })
 
-                if is_spam:
+                # Limit stored history per session.
+                st.session_state.history = (
+                    st.session_state.history[:MAX_HISTORY]
+                )
+
+                if prediction == "SPAM":
 
                     st.markdown(
                         '<div class="result-box spam">'
@@ -238,7 +307,8 @@ with left:
 
                     st.warning(
                         "This message has suspicious characteristics. "
-                        "Avoid clicking links or sharing personal information."
+                        "Avoid clicking unknown links or sharing "
+                        "personal information."
                     )
 
                 else:
@@ -269,15 +339,19 @@ with left:
                 st.caption(
                     f"Spam decision threshold: "
                     f"{SPAM_THRESHOLD * 100:.0f}%. "
-                    "Probabilities are model estimates, not guarantees."
+                    "Model estimates are not guarantees."
                 )
 
-            except Exception as e:
-                st.error(f"Prediction Error: {e}")
+            except Exception:
+                st.error(
+                    "Unable to analyze this message. "
+                    "Please try again."
+                )
 
-# ---------------------------------
-# ABOUT SECTION
-# ---------------------------------
+
+# ==========================================
+# 9. ABOUT SECTION
+# ==========================================
 
 with right:
 
@@ -292,6 +366,8 @@ with right:
     - Validation-based threshold tuning
     - SMS Spam Collection dataset
     - Real-time predictions
+    - Input validation
+    - Protected CSV exports
     """)
 
     st.metric(
@@ -315,9 +391,10 @@ with right:
         "on this number 923201292512"
     )
 
-# ---------------------------------
-# PREDICTION HISTORY
-# ---------------------------------
+
+# ==========================================
+# 10. PREDICTION HISTORY
+# ==========================================
 
 st.divider()
 
@@ -341,28 +418,61 @@ if st.session_state.history:
         }
     )
 
-    csv = history_df.to_csv(
-        index=False
-    ).encode("utf-8")
+    # Protect exported CSV values against formulas.
+    safe_df = history_df.copy()
+
+    for column in safe_df.columns:
+        safe_df[column] = safe_df[column].apply(
+            sanitize_csv_value
+        )
+
+    csv_buffer = io.StringIO()
+
+    safe_df.to_csv(
+        csv_buffer,
+        index=False,
+        quoting=csv.QUOTE_ALL
+    )
 
     st.download_button(
         "⬇️ Download CSV Report",
-        csv,
+        csv_buffer.getvalue().encode("utf-8-sig"),
         "spam_detection_history.csv",
-        "text/csv"
+        "text/csv",
+        use_container_width=True
     )
 
     if st.button("🗑️ Clear History"):
+
         st.session_state.history = []
+
         st.rerun()
 
 else:
 
     st.info("No messages analyzed yet.")
 
-# ---------------------------------
-# FOOTER
-# ---------------------------------
+
+# ==========================================
+# 11. PRIVACY NOTICE
+# ==========================================
+
+st.divider()
+
+st.subheader("🔒 Privacy & Security")
+
+st.caption(
+    "Messages are processed for spam classification. "
+    "Prediction history is held in the current Streamlit session "
+    "and is not saved by this application to a permanent database. "
+    "Avoid submitting passwords, financial details, or other "
+    "sensitive personal information."
+)
+
+
+# ==========================================
+# 12. FOOTER
+# ==========================================
 
 st.divider()
 
