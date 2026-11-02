@@ -11,7 +11,7 @@ st.set_page_config(
     layout="wide"
 )
 
-MODEL_PATH = Path(__file__).parent / "spam_detector_improved.pkl"
+MODEL_PATH = Path(__file__).parent / "spam_detector.pkl"
 
 @st.cache_resource
 def load_model():
